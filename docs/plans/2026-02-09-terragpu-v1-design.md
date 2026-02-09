@@ -60,20 +60,20 @@ model.predict(stack).export("lulc_2021.tif", format="cog")
 
 ## 4. Architecture
 
-TerraGPU uses a three-layer architecture that separates the scientist-facing API from the optimization engine and backend libraries.
+TerraGPU uses a two-layer architecture: a scientist-facing API layer on top of a backend layer powered by xarray, Dask, and RAPIDS.
 
 ```
 ┌─────────────────────────────────────────────────┐
 │                  API Layer                       │
 │  tg.context() · RasterStack · tg.ml · tg.indices│
 ├─────────────────────────────────────────────────┤
-│                Engine Layer                      │
-│  DAG Builder · GPU/CPU Dispatch · Chunk Tuning   │
-├─────────────────────────────────────────────────┤
 │               Backend Layer                      │
-│  cupy · cuDF · cuML · stackstac · rasterio · dask│
+│  xarray · Dask · dask-cuda · cupy · cuML ·       │
+│  stackstac · rasterio                            │
 └─────────────────────────────────────────────────┘
 ```
+
+**There is no custom DAG engine.** Dask already IS a DAG execution engine — when you perform lazy operations on Dask-backed xarray arrays, Dask builds and optimizes a task graph automatically. TerraGPU's value is the scientist-friendly API on top and GPU backend dispatch underneath.
 
 ### 4.1 API Layer (what scientists touch)
 
@@ -97,9 +97,26 @@ ctx = tg.context(
 
 #### RasterStack
 
-The core fluent object. All operations return a new RasterStack (immutable), enabling method chaining. Lazy by default — nothing executes until a terminal operation is called.
+The core fluent object. Internally wraps a Dask-backed xarray DataArray. All operations return a new RasterStack (immutable), enabling method chaining. Lazy by default — Dask builds the computation graph, nothing executes until a terminal operation is called.
 
-**Lazy operations (build the DAG):**
+```python
+class RasterStack:
+    def __init__(self, data: xr.DataArray, ctx: Context):
+        self._data = data          # Dask-backed xarray DataArray (lazy)
+        self._ctx = ctx
+
+    def compute_index(self, name):
+        formula = tg.indices.get(name)
+        # Adds to the Dask graph — no compute happens yet
+        result = formula.apply(self._data)
+        return RasterStack(result, self._ctx)
+
+    def compute(self):
+        # Triggers Dask DAG execution
+        return self._data.compute()
+```
+
+**Lazy operations (extend the Dask graph):**
 - `.cloud_mask(method, keep, ...)`
 - `.compute_index(name_or_list)`
 - `.temporal_composite(period, method)`
@@ -108,13 +125,13 @@ The core fluent object. All operations return a new RasterStack (immutable), ena
 - `.select_bands(bands)`
 - `.apply(func)` — custom user function
 
-**Terminal operations (trigger execution):**
+**Terminal operations (trigger Dask execution):**
 - `.compute()` — materialize in GPU/CPU memory
 - `.export(path, format, ...)` — write to disk
 - `.to_torch()`, `.to_xarray()`, `.to_numpy()`, `.to_cupy()`, `.to_dataframe()`
 - `.plot()` — quick visualization
 
-**Metadata access (no compute):**
+**Metadata access (no compute needed):**
 - `.crs`, `.resolution`, `.bounds`, `.bands`, `.timestamps`, `.shape`
 
 #### Dataset Composition
@@ -129,27 +146,28 @@ combined = sentinel_stack | dem_stack
 dataset = sentinel_stack & worldcover_labels
 ```
 
-### 4.2 Engine Layer (optimization and dispatch)
+### 4.2 Backend Layer (I/O, compute, and scheduling)
 
-The engine sits between the user-facing API and the backends. It:
-
-1. **Builds a DAG** of operations from the chained method calls
-2. **Optimizes** the DAG (fuse sequential element-wise ops, reorder for memory efficiency)
-3. **Dispatches** each operation to GPU or CPU based on data size and available VRAM
-4. **Manages chunking** — auto-tunes chunk sizes to fit GPU memory constraints
-5. **Coordinates Dask** for distributed execution when data exceeds single-GPU memory
-
-The scientist never interacts with this layer directly.
-
-### 4.3 Backend Layer (I/O and compute)
+The backend layer leverages existing battle-tested libraries. Dask handles all task graph construction, optimization, and scheduling. `dask-cuda` provides GPU-aware scheduling.
 
 | Concern | GPU Backend | CPU Fallback |
 |---------|------------|--------------|
 | Array ops | cupy | numpy |
+| Lazy arrays | xarray + Dask | xarray + Dask |
 | Tabular ops | cuDF | pandas |
 | ML | cuML | scikit-learn |
 | I/O | stackstac + rasterio | stackstac + rasterio |
 | Scheduling | dask-cuda | dask |
+
+**How lazy execution works:**
+
+1. Each fluent method on RasterStack appends xarray/Dask operations to the underlying Dask graph
+2. Dask automatically handles: task graph optimization, memory management, chunk scheduling
+3. `dask-cuda` routes array operations to GPU via cupy when a CUDA device is available
+4. Terminal operations (`.compute()`, `.export()`, `.to_torch()`) trigger Dask to execute the full graph
+5. For data exceeding single-GPU memory, Dask handles chunked execution automatically
+
+**Future optimization (v2+):** Custom Dask graph optimization passes for TerraGPU-specific patterns (e.g., fusing sequential band math into single GPU kernels via `cupy.fuse`, optimizing rechunking order for GPU VRAM).
 
 The backend layer also provides interop bridges:
 - **PyTorch:** zero-copy via DLPack (`stack.to_torch()`)
@@ -418,7 +436,7 @@ stack.to_xarray().hvplot()
 
 ### In Scope
 - Context object with full configuration
-- RasterStack fluent API with lazy execution
+- RasterStack fluent API with lazy execution (Dask-backed)
 - STAC discovery and ingestion (Planetary Computer, Element84)
 - Sentinel-2 first-class support (band mappings, SCL cloud masking)
 - Extensible spectral index registry (string + callable)
@@ -430,6 +448,7 @@ stack.to_xarray().hvplot()
 - Basic GPU viz integration
 
 ### Out of Scope (future versions)
+- Custom Dask graph optimization passes (v2 — fusing band math, VRAM-aware rechunking)
 - Landsat, Sentinel-1, or other sensor support
 - Vector operations (spatial joins, point-in-polygon)
 - Deep learning training (TorchGeo's domain)
@@ -445,10 +464,7 @@ stack.to_xarray().hvplot()
 terragpu/
 ├── __init__.py              # tg.context(), top-level API
 ├── context.py               # Context object
-├── rasterstack.py           # RasterStack fluent API
-├── engine/
-│   ├── dag.py               # DAG builder and optimizer
-│   └── dispatch.py          # GPU/CPU dispatch logic
+├── rasterstack.py           # RasterStack fluent API (wraps Dask-backed xarray)
 ├── stac/
 │   ├── discovery.py         # STAC API queries
 │   ├── ingestion.py         # COG loading and stacking
@@ -471,6 +487,8 @@ terragpu/
     └── plotting.py          # GPU viz tool integration
 ```
 
+Note: No `engine/` directory. Dask IS the execution engine. The RasterStack translates fluent API calls into Dask-backed xarray operations directly.
+
 ---
 
 ## 13. Dependencies
@@ -479,7 +497,7 @@ terragpu/
 - `cupy` — GPU array operations
 - `cudf` — GPU dataframes (for tabular ML path)
 - `cuml` — GPU machine learning
-- `dask` / `dask-cuda` — lazy computation and distributed scheduling
+- `dask` / `dask-cuda` — lazy computation, task graph, and GPU-aware scheduling
 - `pystac-client` — STAC API queries
 - `stackstac` — STAC to xarray stacking
 - `rasterio` — geospatial I/O (GDAL bindings)
