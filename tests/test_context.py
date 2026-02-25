@@ -1,6 +1,6 @@
 import pytest
 
-from terragpu.context import Context, context
+from terragpu.context import context
 
 
 class TestContextCreation:

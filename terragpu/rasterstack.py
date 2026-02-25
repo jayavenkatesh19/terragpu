@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import numpy as np
 import xarray as xr
@@ -79,9 +80,7 @@ class RasterStack:
         """Compute spectral index/indices. Requires terragpu.indices."""
         raise NotImplementedError("Index computation not yet implemented (see Issue #3)")
 
-    def temporal_composite(
-        self, period: str, method: str = "median", **kwargs: Any
-    ) -> RasterStack:
+    def temporal_composite(self, period: str, method: str = "median", **kwargs: Any) -> RasterStack:
         """Temporal compositing. Requires terragpu.ops.composite."""
         raise NotImplementedError("Temporal compositing not yet implemented (see Issue #4)")
 
@@ -97,7 +96,7 @@ class RasterStack:
 
     def compute(self) -> xr.DataArray:
         """Trigger Dask execution and return materialized DataArray."""
-        return self._data.compute()
+        return self._data.compute()  # type: ignore[no-any-return]
 
     def export(self, path: str, format: str = "cog", **kwargs: Any) -> None:
         """Export to file. Requires terragpu.io.export."""
@@ -111,7 +110,7 @@ class RasterStack:
 
     def to_numpy(self) -> np.ndarray:
         """Compute and return as numpy array."""
-        return self._data.compute().values
+        return self._data.compute().values  # type: ignore[no-any-return]
 
     def to_xarray(self) -> xr.DataArray:
         """Return the underlying xarray DataArray (still lazy if not computed)."""
@@ -138,11 +137,6 @@ class RasterStack:
 
     def __repr__(self) -> str:
         bands = self.bands
-        band_str = (
-            f"{len(bands)} bands ({', '.join(bands[:3])}{'...' if len(bands) > 3 else ''})"
-        )
+        band_str = f"{len(bands)} bands ({', '.join(bands[:3])}{'...' if len(bands) > 3 else ''})"
         shape_str = " x ".join(str(s) for s in self.shape)
-        return (
-            f"RasterStack({shape_str}, {band_str}, "
-            f"crs={self.crs}, resolution={self.resolution})"
-        )
+        return f"RasterStack({shape_str}, {band_str}, crs={self.crs}, resolution={self.resolution})"
